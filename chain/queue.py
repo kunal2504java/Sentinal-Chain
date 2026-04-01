@@ -62,8 +62,10 @@ class PendingEventQueue:
                     created_at TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     last_attempt TEXT,
+                    next_attempt_at TEXT,
                     tx_hash TEXT,
-                    submitted_at TEXT
+                    submitted_at TEXT,
+                    failed_at TEXT
                 )
                 """
             )
@@ -79,10 +81,11 @@ class PendingEventQueue:
                     ipfs_cid,
                     created_at,
                     attempts,
-                    last_attempt
-                ) VALUES (?, ?, ?, ?, 0, NULL)
+                    last_attempt,
+                    next_attempt_at
+                ) VALUES (?, ?, ?, ?, 0, NULL, ?)
                 """,
-                (_serialize_event(event), clip_hash, ipfs_cid, _utc_now()),
+                (_serialize_event(event), clip_hash, ipfs_cid, _utc_now(), _utc_now()),
             )
             return int(cursor.lastrowid)
 
@@ -92,9 +95,9 @@ class PendingEventQueue:
             connection.row_factory = sqlite3.Row
             rows = connection.execute(
                 """
-                SELECT id, event_json, clip_hash, ipfs_cid, created_at, attempts, last_attempt
+                SELECT id, event_json, clip_hash, ipfs_cid, created_at, attempts, last_attempt, next_attempt_at
                 FROM pending_events
-                WHERE tx_hash IS NULL
+                WHERE tx_hash IS NULL AND failed_at IS NULL
                 ORDER BY created_at ASC
                 """
             ).fetchall()
@@ -106,17 +109,44 @@ class PendingEventQueue:
             pending.append(record)
         return pending
 
-    def increment_attempts(self, queue_id: int) -> None:
+    def _retry_delay_seconds(self, attempts: int) -> int:
+        """Return the next retry delay based on exponential backoff."""
+        schedule = [30, 60, 120, 300]
+        if attempts < len(schedule):
+            return schedule[attempts]
+        return 300
+
+    def increment_attempts(self, queue_id: int, attempts: int) -> None:
         """Increment the retry attempt counter for a queued event."""
+        now = datetime.now(timezone.utc)
+        next_attempt = now.timestamp() + self._retry_delay_seconds(attempts)
         with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE pending_events
                 SET attempts = attempts + 1,
+                    last_attempt = ?,
+                    next_attempt_at = ?
+                WHERE id = ?
+                """,
+                (
+                    now.isoformat().replace("+00:00", "Z"),
+                    datetime.fromtimestamp(next_attempt, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+                    queue_id,
+                ),
+            )
+
+    def mark_failed(self, queue_id: int) -> None:
+        """Mark a queued event as permanently failed."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE pending_events
+                SET failed_at = ?,
                     last_attempt = ?
                 WHERE id = ?
                 """,
-                (_utc_now(), queue_id),
+                (_utc_now(), _utc_now(), queue_id),
             )
 
     def mark_submitted(self, queue_id: int, tx_hash: str) -> None:
@@ -136,8 +166,17 @@ class PendingEventQueue:
     def retry_pending(self, logger: AvalancheLogger) -> list[str]:
         """Retry all pending blockchain submissions and return successful tx hashes."""
         submitted_hashes: list[str] = []
+        now = datetime.now(timezone.utc)
         for record in self.get_pending():
-            self.increment_attempts(record["id"])
+            next_attempt_at = record.get("next_attempt_at")
+            if next_attempt_at:
+                scheduled = datetime.fromisoformat(next_attempt_at.replace("Z", "+00:00"))
+                if scheduled > now:
+                    continue
+            if int(record["attempts"]) >= 20:
+                self.mark_failed(record["id"])
+                continue
+            self.increment_attempts(record["id"], int(record["attempts"]))
             try:
                 tx_hash = logger.submit_queued_event(
                     event_payload=record["event"],
