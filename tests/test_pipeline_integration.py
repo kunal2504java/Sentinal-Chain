@@ -11,6 +11,7 @@ import pytest
 
 from config import load_settings
 from core.detector import Event
+import pipeline
 
 cv2 = pytest.importorskip("cv2")
 from pipeline import run_pipeline
@@ -128,13 +129,20 @@ def test_pipeline_integration(tmp_path, monkeypatch) -> None:
     frames = [np.full((32, 32, 3), fill_value=index * 20, dtype=np.uint8) for index in range(6)]
     capture = FakeCapture(frames)
     detector = FakeDetector(trigger_at=4)
+    monotonic_state = {"value": 0.0}
+
+    def fake_monotonic() -> float:
+        monotonic_state["value"] += 1.0
+        return monotonic_state["value"]
+
+    monkeypatch.setattr(pipeline.time, "monotonic", fake_monotonic)
 
     settings = replace(
         load_settings(),
         camera_source="tests/fixtures/sample_fire.mp4",
         camera_id="CAM_TEST",
         events_dir=events_dir,
-        process_fps=10,
+        process_fps=100000,
         retry_interval_seconds=60,
         reconnect_interval_seconds=1,
     )
